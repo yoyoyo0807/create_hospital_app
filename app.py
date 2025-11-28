@@ -355,9 +355,17 @@ with st.spinner("データを読み込み・前処理中..."):
     scene = read_any(scene_file)
     lines = build_lines(emg, addr, scene)
 
-# 日付候補
-lines["date"] = lines["inquiry_end_time"].dt.date
-all_dates = sorted(lines["date"].unique())
+# 日付列を作成（欠損があっても壊れないようにしておく）
+lines["date"] = pd.to_datetime(lines["inquiry_end_time"], errors="coerce").dt.date
+
+# NaT/欠損を除いてからユニーク日付をソート
+date_series = lines["date"].dropna()
+
+if date_series.empty:
+    st.error("有効な日付データがありません。アップロードしたファイルを確認してください。")
+    st.stop()
+
+all_dates = sorted(date_series.unique())
 
 st.sidebar.header("2️⃣ フィルタ条件")
 
