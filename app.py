@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import folium
-from folium.plugins import TimestampedGeoJson, Fullscreen
+from folium.plugins import TimestampedGeoJson, Fullscreen, BeautifyIcon  # ★追加
 from datetime import datetime, date
 from streamlit.components.v1 import html
 
@@ -355,29 +355,59 @@ with st.spinner("データを読み込み・前処理中..."):
     scene = read_any(scene_file)
     lines = build_lines(emg, addr, scene)
 
-# 日付列を作成（欠損があっても壊れないようにしておく）
+# ---- 日付列の準備 ----
 lines["date"] = pd.to_datetime(lines["inquiry_end_time"], errors="coerce").dt.date
-
-# NaT/欠損を除いてからユニーク日付をソート
 date_series = lines["date"].dropna()
 
 if date_series.empty:
     st.error("有効な日付データがありません。アップロードしたファイルを確認してください。")
     st.stop()
 
-all_dates = sorted(date_series.unique())
+min_date = date_series.min()
+max_date = date_series.max()
 
 st.sidebar.header("2️⃣ フィルタ条件")
 
-date_sel = st.sidebar.selectbox("日付", all_dates, format_func=lambda d: d.strftime("%Y-%m-%d"))
+# ★ 期間で選択（開始日〜終了日）
+date_range = st.sidebar.date_input(
+    "期間（開始日〜終了日）",
+    (min_date, max_date),
+    min_value=min_date,
+    max_value=max_date,
+)
 
-# 選択した日付で一旦絞る
-day_base = lines[lines["date"] == date_sel].copy()
+# date_input は 1日だけ選ぶと date 型になるので、タプル/単体両方に対応
+if isinstance(date_range, (list, tuple)):
+    start_date, end_date = date_range
+else:
+    start_date, end_date = min_date, date_range
 
-# 病院候補
-hosp_options = ["（全て）"] + sorted(day_base["related_hospital"].dropna().unique().tolist())
-hosp_sel = st.sidebar.selectbox("病院（問い合わせ先）", hosp_options)
+# 選択期間で絞る
+mask = (lines["date"] >= start_date) & (lines["date"] <= end_date)
+day_base = lines[mask].copy()
 
+# ---- 病院候補（問い合わせ件数の多い順）----
+hosp_counts = (
+    day_base
+    .dropna(subset=["related_hospital"])
+    .groupby("related_hospital")["case_id"]
+    .nunique()  # 案件数で数える
+    .reset_index(name="n_cases")
+)
+
+# 件数の多い順にソート
+hosp_counts = hosp_counts.sort_values("n_cases", ascending=False)
+
+# ラベル「病院名（◯件）」を作る
+hosp_labels = ["（全て）"]
+label_to_name = {"（全て）": None}
+
+for _, row in hosp_counts.iterrows():
+    label = f"{row['related_hospital']}（{int(row['n_cases'])}件）"
+    hosp_labels.append(label)
+    label_to_name[label] = row["related_hospital"]
+
+hosp_label_sel = st.sidebar.selectbox("病院（問い合わせ先）", hosp_labels)
 # 時間帯
 time_options = ["（全て）", "0-6", "6-12", "12-18", "18-24"]
 time_sel = st.sidebar.selectbox("時間帯", time_options)
@@ -390,7 +420,7 @@ cond_sel = st.sidebar.selectbox("症状", cond_options)
 map_type = st.sidebar.radio("表示するマップ", ["現場↔病院 接続マップ", "病院タイムライン"])
 
 # 実際にフィルタ値を設定
-hosp_val = None if hosp_sel == "（全て）" else hosp_sel
+hosp_val = label_to_name.get(hosp_label_sel)  # ラベル→病院名に戻す
 time_val = None if time_sel == "（全て）" else time_sel
 cond_val = None if cond_sel == "（全て）" else cond_sel
 
@@ -403,7 +433,7 @@ if time_val is not None:
 if cond_val is not None:
     day = day[day["main_condition"] == cond_val]
 
-st.write(f"### 日付: {date_sel.strftime('%Y-%m-%d')} / レコード数: {len(day)}")
+st.write(f"### 期間: {start_date} 〜 {end_date} / レコード数: {len(day)}")
 
 if day.empty:
     st.warning("この条件に該当するデータがありません。フィルタを緩めてください。")
