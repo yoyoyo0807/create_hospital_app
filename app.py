@@ -9,6 +9,7 @@ from streamlit.components.v1 import html
 # ===========================
 
 def clean_str(s):
+    """前後の空白や全角スペースを削除"""
     return str(s).replace("\u3000", "").strip()
 
 def detect_condition(row):
@@ -290,7 +291,7 @@ def make_hospital_timeline_map(df, step_minutes=10):
     m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
     Fullscreen().add_to(m)
 
-    # ---- 灰色の病院ピン（常に表示）----
+    # 灰色の病院ピン（常に表示）
     fg_h = folium.FeatureGroup(name="病院位置", show=True)
     hosp_pos = (
         df.dropna(subset=["lat", "lon"])
@@ -308,7 +309,7 @@ def make_hospital_timeline_map(df, step_minutes=10):
         ).add_to(fg_h)
     fg_h.add_to(m)
 
-    # ---- 時系列ポイント（青=可 / 赤=不可）----
+    # 時系列ポイント（青=可 / 赤=不可）
     feats = []
     for _, r in df.iterrows():
         if pd.isna(r["inquiry_end_time"]):
@@ -336,7 +337,7 @@ def make_hospital_timeline_map(df, step_minutes=10):
     return m
 
 # ===========================
-# マップ：救急需要×受入困難 ヒートマップ
+# マップ：救急需要×受入困難ヒートマップ
 # ===========================
 
 def make_demand_difficulty_heatmap(day):
@@ -344,7 +345,11 @@ def make_demand_difficulty_heatmap(day):
     救急需要 × 受入困難 ヒートマップ
     - 単位：1現場（case_id）
     - 重み：その現場での「受入不可件数」 n_ng
-      → 需要が多くて、かつ受入不可が多い地点ほど強く光る
+      → 需要が多くて、かつ受入不可が多い地点ほどヒートマップが強く光る
+    - さらに：
+      ・各現場を CircleMarker で表示
+      ・色：受入不可がある現場＝赤、ない現場＝オレンジ
+      ・サイズ：問い合わせ件数に応じて少し大きく
     """
 
     # 現場ごとに集計
@@ -358,16 +363,14 @@ def make_demand_difficulty_heatmap(day):
         .reset_index()
     )
 
-    # 重み = n_ng（受入不可件数）
+    # 重み = 受入不可件数
     scene_stats["weight"] = scene_stats["n_ng"].astype(float)
 
-    # 0 の点はヒートマップにほぼ影響しないので、そのままでもOKだが
-    # 全部 0 の場合はマップだけ返す
-    if scene_stats["weight"].sum() == 0:
+    if scene_stats.empty:
         m = folium.Map(location=[38.26, 140.87], zoom_start=11)
         folium.Marker(
             [38.26, 140.87],
-            popup="この条件では受入困難な地点がありません。",
+            popup="この条件では現場データがありません。",
         ).add_to(m)
         return m
 
@@ -377,18 +380,48 @@ def make_demand_difficulty_heatmap(day):
     m = folium.Map(location=[center_lat, center_lon], zoom_start=11)
     Fullscreen().add_to(m)
 
-    heat_data = [
-        [row["scene_lat"], row["scene_lon"], row["weight"]]
-        for _, row in scene_stats.iterrows()
-    ]
+    # ヒートマップ（受入不可件数が多いほど強く光る）
+    if scene_stats["weight"].sum() > 0:
+        heat_data = [
+            [row["scene_lat"], row["scene_lon"], row["weight"]]
+            for _, row in scene_stats.iterrows()
+        ]
 
-    HeatMap(
-        heat_data,
-        radius=18,
-        blur=15,
-        max_zoom=13,
-    ).add_to(m)
+        HeatMap(
+            heat_data,
+            radius=18,
+            blur=15,
+            max_zoom=13,
+        ).add_to(m)
 
+    # 現場ポイント（位置を明示）
+    fg_points = folium.FeatureGroup(name="現場ポイント", show=True)
+
+    for _, r in scene_stats.iterrows():
+        # 受入不可が1件以上あれば赤、それ以外はオレンジ
+        color = "red" if r["n_ng"] > 0 else "orange"
+
+        # 問い合わせ件数でサイズを少し変える（上限あり）
+        base_size = 3
+        size = base_size + min(int(r["n_total"]), 5)  # 3〜8くらい
+
+        popup = (
+            f"case_id: {r['case_id']}<br>"
+            f"問い合わせ件数: {int(r['n_total'])}件<br>"
+            f"受入不可件数: {int(r['n_ng'])}件"
+        )
+
+        folium.CircleMarker(
+            [r["scene_lat"], r["scene_lon"]],
+            radius=size,
+            color=color,
+            fill=True,
+            fill_opacity=0.9,
+            popup=popup,
+        ).add_to(fg_points)
+
+    fg_points.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
     return m
 
 # ===========================
