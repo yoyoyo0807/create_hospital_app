@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import folium
-from folium.plugins import TimestampedGeoJson, Fullscreen, BeautifyIcon  # ★追加
+from folium.plugins import TimestampedGeoJson, Fullscreen, BeautifyIcon
 from datetime import datetime, date
 from streamlit.components.v1 import html
 
@@ -44,7 +44,6 @@ def classify_available(info):
         return False
     return False  # その他も一旦不可として扱う
 
-
 def read_any(file_obj):
     """アップロードされたファイルを csv / xlsx 判定して読む"""
     name = file_obj.name.lower()
@@ -52,7 +51,6 @@ def read_any(file_obj):
         return pd.read_excel(file_obj)
     else:
         return pd.read_csv(file_obj)
-
 
 def build_lines(emg, addr, scene):
     """Colab でやっていた前処理をまとめて実行して、lines を返す"""
@@ -135,9 +133,18 @@ def build_lines(emg, addr, scene):
 
     return lines
 
+@st.cache_data
+def build_lines_cached(emg, addr, scene):
+    """前処理結果をキャッシュ"""
+    return build_lines(emg, addr, scene)
 
 def make_hospital_timeline_map(df_hosp_day, step_minutes=10):
-    """その日の df_hosp を使って病院タイムラインマップを作成"""
+    """期間内の df_hosp を使って病院タイムラインマップを作成"""
+
+    # 点が多すぎるときは最近のものだけに間引く
+    MAX_POINTS = 1500
+    if len(df_hosp_day) > MAX_POINTS:
+        df_hosp_day = df_hosp_day.sort_values("inquiry_end_time").iloc[-MAX_POINTS:].copy()
 
     center_lat = df_hosp_day["lat"].mean()
     center_lon = df_hosp_day["lon"].mean()
@@ -191,16 +198,20 @@ def make_hospital_timeline_map(df_hosp_day, step_minutes=10):
     tg.add_to(m)
     return m
 
-
 def make_connection_map(day, highlight_top10=True):
     """
     現場↔病院 接続マップを作成
-    - 現場：オレンジ丸
+    - 現場：受入不可率が高い現場は赤、それ以外オレンジ
     - 青線：収容可
     - 赤線：収容不可
-    - 緑線：収容不可→最終搬送
-    - 病院ピン：Marker（青 / 濃い青 / 赤）
+    - 緑線：受入不可→最終搬送
+    - 病院ピン：小さめ Marker（青 / 濃い青 / 赤）
     """
+
+    # 件数が多すぎるときは最近の案件だけに絞る
+    MAX_ROWS = 3000
+    if len(day) > MAX_ROWS:
+        day = day.sort_values("inquiry_end_time").iloc[-MAX_ROWS:].copy()
 
     day = day.dropna(subset=["scene_lat", "scene_lon", "rel_lat", "rel_lon"])
     center_lat = pd.concat([day["scene_lat"], day["rel_lat"]]).mean()
@@ -209,21 +220,45 @@ def make_connection_map(day, highlight_top10=True):
     m = folium.Map(location=[center_lat, center_lon], zoom_start=11)
     Fullscreen().add_to(m)
 
-    # 現場ピン（オレンジ）
-    fg_scenes = folium.FeatureGroup(name="現場（オレンジ）", show=True)
-    scenes_unique = day[["case_id", "scene_lat", "scene_lon"]].drop_duplicates("case_id")
-    for _, r in scenes_unique.iterrows():
+    # ---- 現場ピン：受入不可率の高い現場は赤、それ以外オレンジ ----
+    scene_stats = (
+        day
+        .groupby(["case_id", "scene_lat", "scene_lon"])
+        .agg(
+            n_total=("case_id", "size"),
+            n_ng=("is_available", lambda s: (s == False).sum()),
+        )
+        .reset_index()
+    )
+    scene_stats["reject_rate"] = scene_stats["n_ng"] / scene_stats["n_total"]
+
+    THR = 0.5  # 受入不可率 50%以上を「多い」とみなす
+
+    fg_scenes = folium.FeatureGroup(name="現場（オレンジ/赤）", show=True)
+    for _, r in scene_stats.iterrows():
+        if (r["reject_rate"] >= THR) and (r["n_total"] >= 1):
+            color = "red"
+        else:
+            color = "orange"
+
+        popup_html = (
+            f"case_id: {r['case_id']}<br>"
+            f"問い合わせ回数: {int(r['n_total'])}件<br>"
+            f"受入不可: {int(r['n_ng'])}件<br>"
+            f"受入不可率: {r['reject_rate']:.2f}"
+        )
+
         folium.CircleMarker(
             location=[r["scene_lat"], r["scene_lon"]],
             radius=4,
-            color="orange",
+            color=color,
             fill=True,
             fill_opacity=0.8,
-            popup=f"case_id: {r['case_id']}",
+            popup=popup_html,
         ).add_to(fg_scenes)
     fg_scenes.add_to(m)
 
-    # 受入可（青）
+    # ---- 受入可（青線）----
     fg_ok = folium.FeatureGroup(name="受入可の問い合わせ", show=True)
     day_ok = day[day["is_available"] == True]
     for _, r in day_ok.iterrows():
@@ -236,7 +271,7 @@ def make_connection_map(day, highlight_top10=True):
         ).add_to(fg_ok)
     fg_ok.add_to(m)
 
-    # 受入不可（赤）
+    # ---- 受入不可（赤線）----
     fg_ng = folium.FeatureGroup(name="受入不可の問い合わせ", show=True)
     day_ng = day[day["is_available"] == False]
     for _, r in day_ng.iterrows():
@@ -249,7 +284,7 @@ def make_connection_map(day, highlight_top10=True):
         ).add_to(fg_ng)
     fg_ng.add_to(m)
 
-    # 受入不可 → 最終搬送（緑）
+    # ---- 受入不可 → 最終搬送（緑線）----
     fg_final = folium.FeatureGroup(name="受入不可→最終搬送", show=False)
     day_ng_final = day_ng.dropna(subset=["final_lat", "final_lon"])
     for _, r in day_ng_final.iterrows():
@@ -262,7 +297,7 @@ def make_connection_map(day, highlight_top10=True):
         ).add_to(fg_final)
     fg_final.add_to(m)
 
-    # 病院ピン（Marker）
+    # ---- 病院ピン（小さめのピン形アイコン）----
     fg_hosp = folium.FeatureGroup(name="問い合わせ病院ピン", show=True)
     hosp_stats = (
         day.dropna(subset=["rel_lat", "rel_lon"])
@@ -296,15 +331,25 @@ def make_connection_map(day, highlight_top10=True):
 
         popup_html = (
             f"{r['related_hospital']}<br>"
-            f"案件数: {int(r['n_total'])}<br>"
+            f"案件数: {int(r['n_total'])}件<br>"
             f"収容可: {int(r['n_ok'])} 件<br>"
             f"受入不可: {int(r['n_ng'])} 件<br>"
             f"※ 上位10%件数なら濃い青"
         )
 
+        icon = BeautifyIcon(
+            icon="hospital-o",
+            icon_shape="marker",
+            border_color=marker_color,
+            border_width=1,
+            text_color="white",
+            background_color=marker_color,
+            icon_size=[18, 18],
+        )
+
         folium.Marker(
             location=[r["lat"], r["lon"]],
-            icon=folium.Icon(color=marker_color, icon="hospital-o", prefix="fa"),
+            icon=icon,
             popup=popup_html,
         ).add_to(fg_hosp)
 
@@ -313,12 +358,10 @@ def make_connection_map(day, highlight_top10=True):
     folium.LayerControl(collapsed=False).add_to(m)
     return m
 
-
 def folium_to_streamlit(m, height=650):
     """Folium マップを Streamlit に埋め込む"""
     m_html = m._repr_html_()
     html(m_html, height=height)
-
 
 # ===========================
 # Streamlit アプリ本体
@@ -353,7 +396,7 @@ with st.spinner("データを読み込み・前処理中..."):
     emg = read_any(emg_file)
     addr = read_any(addr_file)
     scene = read_any(scene_file)
-    lines = build_lines(emg, addr, scene)
+    lines = build_lines_cached(emg, addr, scene)
 
 # ---- 日付列の準備 ----
 lines["date"] = pd.to_datetime(lines["inquiry_end_time"], errors="coerce").dt.date
@@ -382,45 +425,52 @@ if isinstance(date_range, (list, tuple)):
 else:
     start_date, end_date = min_date, date_range
 
+if start_date > end_date:
+    start_date, end_date = end_date, start_date
+
 # 選択期間で絞る
 mask = (lines["date"] >= start_date) & (lines["date"] <= end_date)
 day_base = lines[mask].copy()
+
+if day_base.empty:
+    st.warning("この期間にはデータがありません。期間を変更してください。")
+    st.stop()
 
 # ---- 病院候補（問い合わせ件数の多い順）----
 hosp_counts = (
     day_base
     .dropna(subset=["related_hospital"])
     .groupby("related_hospital")["case_id"]
-    .nunique()  # 案件数で数える
+    .nunique()
     .reset_index(name="n_cases")
 )
 
-# 件数の多い順にソート
-hosp_counts = hosp_counts.sort_values("n_cases", ascending=False)
-
-# ラベル「病院名（◯件）」を作る
 hosp_labels = ["（全て）"]
 label_to_name = {"（全て）": None}
 
-for _, row in hosp_counts.iterrows():
-    label = f"{row['related_hospital']}（{int(row['n_cases'])}件）"
-    hosp_labels.append(label)
-    label_to_name[label] = row["related_hospital"]
+if not hosp_counts.empty:
+    hosp_counts = hosp_counts.sort_values("n_cases", ascending=False)
+    for _, row in hosp_counts.iterrows():
+        label = f"{row['related_hospital']}（{int(row['n_cases'])}件）"
+        hosp_labels.append(label)
+        label_to_name[label] = row["related_hospital"]
 
 hosp_label_sel = st.sidebar.selectbox("病院（問い合わせ先）", hosp_labels)
+
 # 時間帯
 time_options = ["（全て）", "0-6", "6-12", "12-18", "18-24"]
 time_sel = st.sidebar.selectbox("時間帯", time_options)
 
 # 症状
-cond_options = ["（全て）"] + sorted(day_base["main_condition"].dropna().unique().tolist())
+cond_list = sorted(day_base["main_condition"].dropna().unique().tolist())
+cond_options = ["（全て）"] + cond_list
 cond_sel = st.sidebar.selectbox("症状", cond_options)
 
 # マップ種別
 map_type = st.sidebar.radio("表示するマップ", ["現場↔病院 接続マップ", "病院タイムライン"])
 
 # 実際にフィルタ値を設定
-hosp_val = label_to_name.get(hosp_label_sel)  # ラベル→病院名に戻す
+hosp_val = label_to_name.get(hosp_label_sel)
 time_val = None if time_sel == "（全て）" else time_sel
 cond_val = None if cond_sel == "（全て）" else cond_sel
 
@@ -449,6 +499,11 @@ if map_type == "現場↔病院 接続マップ":
 
 else:  # 病院タイムライン
     st.subheader("⏱ 病院タイムライン（10分刻み）")
+
+    # タイムラインは重いので、3日以内に制限
+    if (end_date - start_date).days > 3:
+        st.warning("タイムライン表示は重くなるため、3日以内の期間で指定してください。")
+        st.stop()
 
     # タイムライン用 df_hosp_day を構築
     df_hosp_day = (
